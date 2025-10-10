@@ -65,29 +65,29 @@ alpha-berkeley-framework/
 │   ├── openwebui/                                # No change
 │   └── ...
 │
-├── deployment/                                   # MODIFIED - Simplified deployment
-│   ├── docker-compose.yml                        # NEW - Main compose file
-│   ├── Dockerfile                                # NEW - Framework image
-│   └── .env.example                              # NEW - Environment template
+├── services/                                     # No change - Optional services
+│   └── framework/
+│       └── jupyter/                              # No change - Jupyter service
 │
 ├── tests/                                        # No change
 ├── docs/                                         # No change
 │   └── agent-development-guide.md                # NEW - Guide for building agents
 │
+├── docker-compose.yml                            # NEW - At root (no deployment/ folder)
+├── Dockerfile                                    # NEW - At root (no deployment/ folder)
 ├── .gitignore                                    # No change
-├── .env.example                                  # NEW - Root env template
+├── .env.example                                  # NEW - At root (ONLY ONE)
 ├── config.yml                                    # MODIFIED - Remove applications list
-├── pyproject.toml                                # No change
-├── requirements.txt                              # No change
+├── pyproject.toml                                # MODIFIED - Add framework dependencies
 └── README.md                                     # MODIFIED - Update with new architecture
 ```
 
 ---
 
-## Part 2: Agent Repository Structure (Example: pv-finder-agent)
+## Part 2: Agent Repository Structure (Example: beamline-531-agent)
 
 ```
-pv-finder-agent/
+beamline-531-agent/
 │
 ├── src/
 │   ├── agent/
@@ -99,7 +99,9 @@ pv-finder-agent/
 │   │
 │   └── lib/                                      # Agent-specific libraries
 │       ├── __init__.py
-│       └── pv_search.py                          # Domain logic
+│       ├── motor_control.py                      # Motor control logic
+│       ├── beam_alignment.py                     # Beam alignment logic
+│       └── shutter_control.py                    # Shutter control logic
 │
 ├── tests/
 │   ├── __init__.py
@@ -297,7 +299,7 @@ class AgentClient:
 """FastAPI HTTP Server for Agent."""
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
@@ -418,14 +420,14 @@ class CapabilityHandler:
         raise NotImplementedError
 
 
-# Example: PV Finder Capability
-class PVFinderCapability(CapabilityHandler):
-    """Find PVs in the ALS control system."""
+# Motor Control Capability
+class MotorControlCapability(CapabilityHandler):
+    """Control motors on Beamline 5.3.1."""
     
     def __init__(self):
         super().__init__(
-            name="find_pv",
-            description="Find PVs based on natural language query"
+            name="motor_control",
+            description="Control beamline motors (position, velocity, etc.)"
         )
     
     async def execute(
@@ -433,21 +435,89 @@ class PVFinderCapability(CapabilityHandler):
         parameters: Dict[str, Any],
         context: Dict[str, Any]
     ) -> Any:
-        """Execute PV finding logic."""
-        query = parameters.get("query", "")
+        """Execute motor control logic."""
+        motor_name = parameters.get("motor_name", "")
+        target_position = parameters.get("target_position", 0)
         
-        # Your existing PV finding logic here
-        # This is the same code from src/applications/als_assistant/capabilities/
+        # Your existing motor control logic here
+        # This is the same code from src/applications/beamline_531/capabilities/
+        
+        # Example: EPICS motor control
+        pv = f"BL531:{motor_name}:POSITION"
+        # caput(pv, target_position)
         
         return {
-            "pvs": ["SR:C01:BI:CURRENT", "SR:C02:BI:CURRENT"],
-            "query": query
+            "success": True,
+            "motor": motor_name,
+            "position": target_position,
+            "message": f"Motor {motor_name} moved to {target_position}"
+        }
+
+
+# Beam Alignment Capability
+class BeamAlignmentCapability(CapabilityHandler):
+    """Align the beam on Beamline 5.3.1."""
+    
+    def __init__(self):
+        super().__init__(
+            name="beam_alignment",
+            description="Perform beam alignment procedures"
+        )
+    
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        context: Dict[str, Any]
+    ) -> Any:
+        """Execute beam alignment logic."""
+        alignment_type = parameters.get("type", "auto")
+        
+        # Your existing beam alignment logic here
+        
+        return {
+            "success": True,
+            "alignment_type": alignment_type,
+            "beam_centered": True,
+            "message": "Beam alignment completed successfully"
+        }
+
+
+# Shutter Control Capability
+class ShutterControlCapability(CapabilityHandler):
+    """Control shutters on Beamline 5.3.1."""
+    
+    def __init__(self):
+        super().__init__(
+            name="shutter_control",
+            description="Open/close beamline shutters"
+        )
+    
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        context: Dict[str, Any]
+    ) -> Any:
+        """Execute shutter control logic."""
+        shutter_id = parameters.get("shutter_id", "")
+        action = parameters.get("action", "open")  # "open" or "close"
+        
+        # Your existing shutter control logic here
+        pv = f"BL531:SHUTTER:{shutter_id}:STATE"
+        # caput(pv, 1 if action == "open" else 0)
+        
+        return {
+            "success": True,
+            "shutter": shutter_id,
+            "state": action,
+            "message": f"Shutter {shutter_id} {action}ed"
         }
 
 
 # Capability registry for this agent
 _capabilities = {
-    "find_pv": PVFinderCapability()
+    "motor_control": MotorControlCapability(),
+    "beam_alignment": BeamAlignmentCapability(),
+    "shutter_control": ShutterControlCapability()
 }
 
 
@@ -491,10 +561,18 @@ class AgentRegistry:
 # Global registry
 _agent_registry = AgentRegistry()
 
-# Register capabilities
+# Register capabilities for Beamline 5.3.1
 _agent_registry.register_capability(
-    "find_pv",
-    "Find PVs in the ALS control system"
+    "motor_control",
+    "Control beamline motors (position, velocity, etc.)"
+)
+_agent_registry.register_capability(
+    "beam_alignment",
+    "Perform beam alignment procedures"
+)
+_agent_registry.register_capability(
+    "shutter_control",
+    "Open/close beamline shutters"
 )
 
 
@@ -507,7 +585,7 @@ def get_agent_registry() -> AgentRegistry:
 
 ## Part 4: Docker Configuration Files
 
-### Framework: docker-compose.yml
+### Framework: docker-compose.yml (AT ROOT)
 
 ```yaml
 version: '3.8'
@@ -519,7 +597,7 @@ services:
   framework-api:
     build:
       context: .
-      dockerfile: deployment/Dockerfile
+      dockerfile: Dockerfile
     container_name: framework-api
     ports:
       - "${FRAMEWORK_PORT:-8000}:8000"
@@ -567,7 +645,7 @@ services:
   agent-registry:
     build:
       context: .
-      dockerfile: deployment/Dockerfile.registry
+      dockerfile: Dockerfile.registry
     container_name: agent-registry
     ports:
       - "${REGISTRY_PORT:-8100}:8100"
@@ -628,7 +706,7 @@ volumes:
   jupyter-data:
 ```
 
-### Framework: deployment/Dockerfile
+### Framework: Dockerfile (AT ROOT)
 
 ```dockerfile
 FROM python:3.11-slim
@@ -640,9 +718,9 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy pyproject.toml and install dependencies
+COPY pyproject.toml .
+RUN pip install --no-cache-dir -e .
 
 # Copy source code
 COPY src/ /app/src/
@@ -658,7 +736,7 @@ EXPOSE 8000
 CMD ["python", "-m", "uvicorn", "framework.api:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-### Framework: .env.example
+### Framework: .env.example (AT ROOT - ONLY ONE)
 
 ```bash
 # PostgreSQL Configuration
@@ -688,7 +766,78 @@ PROJECT_ROOT=/app
 TZ=America/Los_Angeles
 ```
 
-### Framework: Modified config.yml
+### Framework: pyproject.toml
+
+```toml
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpha-berkeley-framework"
+version = "0.5.0"
+description = "An open-source, domain-agnostic, capability-based architecture for building intelligent agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Thorsten Hellert", email = "thellert@lbl.gov"},
+]
+
+keywords = [
+    "ai", "agents", "framework", "scientific-computing", "langgraph", 
+    "epics", "accelerator-physics", "als", "berkeley", "agent-framework",
+    "capability-based", "human-in-the-loop", "container-orchestration"
+]
+
+# Core runtime dependencies
+dependencies = [
+    # LangGraph dependencies - CRITICAL VERSION REQUIREMENTS
+    "langgraph>=0.5.2",
+    "langchain-core>=0.3.68",
+    "langgraph-checkpoint-postgres>=2.0.22,<3.0.0",
+    "langgraph-sdk>=0.1.70,<0.2.0",
+    "psycopg[pool]>=3.1.0,<4.0.0",
+    "psycopg-pool>=3.1.0,<4.0.0",
+    "langchain-postgres>=0.0.12,<0.1.0",
+    
+    # Core framework dependencies
+    "rich>=14.0.0",
+    "pydantic-ai>=0.2.11",
+    "python-dotenv>=1.1.0",
+    "PyYAML>=6.0.2",
+    "Jinja2>=3.1.6",
+    "requests>=2.32.3",
+    
+    # API server
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    
+    # HTTP client for agents
+    "httpx>=0.25.0",
+    
+    # Additional dependencies from your project
+    "langchain-openai>=0.3.0",
+    "langchain-google-genai>=2.0.11",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "ipython>=8.12.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+```
+
+### Framework: config.yml
 
 ```yaml
 # Import framework configuration
@@ -748,30 +897,31 @@ file_paths:
 ```yaml
 version: '3.8'
 
-name: pv-finder-agent
+name: beamline-531-agent
 
 services:
-  pv-finder:
+  beamline-531:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: pv-finder-agent
+    container_name: beamline-531-agent
     ports:
-      - "${AGENT_PORT:-8051}:8051"
+      - "${AGENT_PORT:-8053}:8053"
     environment:
-      - AGENT_PORT=8051
-      - AGENT_NAME=pv_finder
+      - AGENT_PORT=8053
+      - AGENT_NAME=beamline_531_control
       - AGENT_HOST=0.0.0.0
       # Optional: Auto-register with framework
       - FRAMEWORK_REGISTRY_URL=${FRAMEWORK_REGISTRY_URL}
       - AUTO_REGISTER=${AUTO_REGISTER:-false}
-      # Domain-specific env vars
-      - CBORG_API_KEY=${CBORG_API_KEY}
-      - CBORG_API_URL=${CBORG_API_URL}
+      # Beamline-specific env vars
+      - BEAMLINE_ID=5.3.1
+      - EPICS_CA_ADDR_LIST=${EPICS_CA_ADDR_LIST}
+      - EPICS_CA_SERVER_PORT=${EPICS_CA_SERVER_PORT}
+      - EPICS_CA_MAX_ARRAY_BYTES=${EPICS_CA_MAX_ARRAY_BYTES:-16384}
+      # API Keys
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - HTTPS_PROXY=${HTTPS_PROXY}
-      - NO_PROXY=${NO_PROXY}
       - PYTHONPATH=/app/src
     volumes:
       - ./src:/app/src:ro
@@ -780,7 +930,7 @@ services:
       - agent-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8051/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8053/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -797,9 +947,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies including EPICS libraries
 RUN apt-get update && apt-get install -y \
     curl \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install
@@ -814,7 +965,7 @@ COPY config.yml /app/
 ENV PYTHONPATH=/app/src
 
 # Expose agent port
-EXPOSE 8051
+EXPOSE 8053
 
 # Run the agent server
 CMD ["python", "src/agent/server.py"]
@@ -824,25 +975,28 @@ CMD ["python", "src/agent/server.py"]
 
 ```bash
 # Agent Configuration
-AGENT_PORT=8051
-AGENT_NAME=pv_finder
+AGENT_PORT=8053
+AGENT_NAME=beamline_531_control
 AGENT_HOST=0.0.0.0
 
 # Framework Integration (Optional)
 FRAMEWORK_REGISTRY_URL=http://agent-registry:8100
 AUTO_REGISTER=false
 
-# Domain-Specific Configuration
-CBORG_API_KEY=your_cborg_key_here
-CBORG_API_URL=https://cborg.lbl.gov/api
+# Beamline-Specific Configuration
+BEAMLINE_ID=5.3.1
+EPICS_CA_ADDR_LIST=10.0.0.1
+EPICS_CA_SERVER_PORT=5064
+EPICS_CA_MAX_ARRAY_BYTES=16384
 
 # API Keys
 OPENAI_API_KEY=your_openai_key_here
 GEMINI_API_KEY=your_gemini_key_here
 
-# Proxy Settings (if needed)
-HTTPS_PROXY=
-NO_PROXY=localhost,127.0.0.1
+# Safety Settings
+ENABLE_MOTOR_WRITES=false
+ENABLE_SHUTTER_CONTROL=false
+MAX_MOTOR_SPEED=10.0
 ```
 
 ### Agent: pyproject.toml
@@ -853,9 +1007,9 @@ requires = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pv-finder-agent"
+name = "beamline-531-agent"
 version = "0.1.0"
-description = "PV Finder Agent for ALS Control System"
+description = "Beamline 5.3.1 Control Agent for ALS"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -866,6 +1020,8 @@ dependencies = [
     "pydantic>=2.5.0",
     "httpx>=0.25.0",
     "python-dotenv>=1.0.0",
+    # EPICS dependencies
+    "pyepics>=3.5.0",
 ]
 
 [project.optional-dependencies]
@@ -885,6 +1041,7 @@ uvicorn>=0.24.0
 pydantic>=2.5.0
 httpx>=0.25.0
 python-dotenv>=1.0.0
+pyepics>=3.5.0
 ```
 
 ### Agent: config.yml
@@ -892,14 +1049,23 @@ python-dotenv>=1.0.0
 ```yaml
 # Agent Configuration
 agent:
-  name: pv_finder
+  name: beamline_531_control
   version: "0.1.0"
-  description: "Find PVs in the ALS control system"
+  description: "Control agent for ALS Beamline 5.3.1"
+  beamline_id: "5.3.1"
 
 # Capabilities provided by this agent
 capabilities:
-  - name: find_pv
-    description: "Find PVs based on natural language query"
+  - name: motor_control
+    description: "Control beamline motors (position, velocity, etc.)"
+    always_active: true
+  
+  - name: beam_alignment
+    description: "Perform beam alignment procedures"
+    always_active: true
+  
+  - name: shutter_control
+    description: "Open/close beamline shutters"
     always_active: true
 
 # Agent-specific settings
@@ -907,10 +1073,17 @@ settings:
   timeout: 30
   max_retries: 3
 
-# Domain-specific configuration
-cborg:
-  api_url: ${CBORG_API_URL}
-  timeout: 10
+# EPICS configuration
+epics:
+  ca_addr_list: ${EPICS_CA_ADDR_LIST}
+  ca_server_port: ${EPICS_CA_SERVER_PORT:-5064}
+  ca_max_array_bytes: ${EPICS_CA_MAX_ARRAY_BYTES:-16384}
+
+# Safety limits
+safety:
+  enable_motor_writes: ${ENABLE_MOTOR_WRITES:-false}
+  enable_shutter_control: ${ENABLE_SHUTTER_CONTROL:-false}
+  max_motor_speed: ${MAX_MOTOR_SPEED:-10.0}
 ```
 
 ---
@@ -988,14 +1161,17 @@ docker compose down
 - ✅ Keep all existing framework code
 - ➕ Add 2 new files: `agent_registry.py`, `agent_client.py`
 - ➖ Remove `src/applications/` directory
+- ➖ Remove `deployment/` directory
+- 🔄 Move `docker-compose.yml` and `Dockerfile` to root
 - 🔄 Simplify `config.yml` (remove applications list)
-- ➕ Add standard Docker Compose setup
+- ➕ Use only `pyproject.toml` (no requirements.txt)
+- ➕ Single `.env.example` at root
 
 **Agent Repositories:**
 - ➕ Create new repo for each agent
 - ➕ Add FastAPI HTTP server (`server.py`)
 - 📦 Move capability code from framework
-- ➕ Add Docker Compose + Dockerfile
+- ➕ Add Docker Compose + Dockerfile at root
 - ➕ Add dedicated configuration
 
 **No Logic Changes:**
