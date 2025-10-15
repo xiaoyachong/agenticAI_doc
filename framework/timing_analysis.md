@@ -117,8 +117,632 @@ The difference (~24 seconds) is entirely network I/O waiting time, which doesn't
 
 **Recommendation:** Consider parallelizing capability checks or implementing caching for common task patterns.
 
+# Classification Node - Complete Analysis
 
-## Logs 
+## What Classification Does
+
+Classification analyzes the user's task and determines which capabilities are needed to fulfill it.
+
+**Input:**
+```python
+Task: "Read the motor position"
+Available Capabilities: [
+    'memory', 'time_range_parsing', 'python', 'motor_position_read',
+    'motor_position_set', 'detector_image_capture', 
+    'photogrammetry_scan_execute', 'reconstruct_object',
+    'ply_quality_assessment', 'display_object', 'respond', 'clarify'
+]
+```
+
+**Output:**
+```python
+Active Capabilities: ['respond', 'clarify', 'python', 'motor_position_read']
+```
+
+## Why It Checks Each Capability
+
+### The Code Flow:
+
+From `classification_node.py` line 240-280:
+```python
+async def select_capabilities(
+    task: str,
+    available_capabilities: List[BaseCapability],
+    state: AgentState,
+    logger,
+    previous_failure: Optional[str] = None
+) -> List[str]:
+    
+    registry = get_registry()
+    always_active_names = registry.get_always_active_capability_names()
+    
+    active_capabilities: List[str] = []
+    
+    # Step 1: Add always-active capabilities (no LLM needed)
+    for capability in available_capabilities:
+        if capability.name in always_active_names:
+            active_capabilities.append(capability.name)
+    
+    # Step 2: Classify remaining capabilities (LLM call for each)
+    remaining_capabilities = [
+        cap for cap in available_capabilities 
+        if cap.name not in always_active_names
+    ]
+    
+    # ⚠️ SEQUENTIAL LOOP - One LLM call per capability
+    for capability in remaining_capabilities:
+        is_required = await _classify_capability(
+            capability, task, state, logger, previous_failure
+        )
+        
+        if is_required:
+            active_capabilities.append(capability.name)
+    
+    return active_capabilities
+```
+
+### Why Check Each Capability Individually?
+
+Each capability needs separate analysis because:
+
+1. **Different Context** - Each capability has unique:
+   - Instructions (what it does)
+   - Examples (when to use it)
+   - Requirements (what it needs)
+
+2. **Independent Decisions** - Checking if `motor_position_read` is needed is completely different from checking if `python` is needed
+
+3. **Few-Shot Learning** - Each LLM call includes capability-specific examples
+
+## The LLM Call (Per Capability)
+
+### Line that Calls LLM:
+
+`classification_node.py` line 285-340:
+```python
+async def _classify_capability(
+    capability: BaseCapability, 
+    task: str, 
+    state: AgentState, 
+    logger, 
+    previous_failure: Optional[str] = None
+) -> bool:
+    
+    # Get capability-specific instructions and examples
+    classifier = capability.classifier_guide
+    capability_instructions = classifier.instructions
+    examples_string = ClassifierExample.format_examples_for_prompt(
+        classifier.examples
+    )
+    
+    # Build prompt
+    prompt_provider = get_framework_prompts()
+    classification_builder = prompt_provider.get_classification_prompt_builder()
+    system_prompt = classification_builder.get_system_instructions(
+        capability_instructions=capability_instructions,
+        classifier_examples=examples_string,
+        context=None,
+        previous_failure=previous_failure
+    )
+    message = f"{system_prompt}\n\nUser request:\n{task}"
+    
+    # ⚠️ THE LLM CALL (blocking, ~2 seconds each)
+    response_data = await asyncio.to_thread(
+        get_chat_completion,
+        model_config=get_model_config("framework", "classifier"),
+        message=message,
+        output_model=CapabilityMatch,  # Returns {is_match: true/false}
+    )
+    
+    logger.info(f" >>> Capability '{capability.name}' >>> {response_data.is_match}")
+    return response_data.is_match
+```
+
+## Input to LLM (Per Capability)
+
+### Example for `motor_position_read`:
+```
+[System Instructions]
+You are a task classifier. Determine if this capability matches the user's request.
+
+Capability: motor_position_read
+Description: Read current motor angle from hardware
+Provides: MOTOR_POSITION context
+
+Examples of when this capability IS needed:
+- "What's the current position?"
+- "Read the motor angle"
+- "Check where the motor is"
+
+Examples of when this capability is NOT needed:
+- "Move to 45 degrees" (this is motor_position_SET, not read)
+- "Take an image" (different capability)
+
+Return a JSON response: {"is_match": true/false}
+
+User request:
+Read the motor position
+```
+
+**LLM Output:**
+```json
+{
+  "is_match": true
+}
+```
+
+## Does It Use Parallel Processing?
+
+**NO - It's Sequential! ❌**
+
+From the code:
+```python
+# ⚠️ SEQUENTIAL - One at a time
+for capability in remaining_capabilities:
+    is_required = await _classify_capability(...)  # Waits for each
+    if is_required:
+        active_capabilities.append(capability.name)
+```
+
+### Your Execution Timeline:
+```
+10:53:08 - 'memory' >>> False                    [2s]
+10:53:10 - 'time_range_parsing' >>> False        [2s]
+10:53:17 - 'python' >>> True                     [7s] ⚠️
+10:53:19 - 'motor_position_read' >>> True        [2s]
+10:53:21 - 'motor_position_set' >>> False        [2s]
+10:53:22 - 'detector_image_capture' >>> False    [1s]
+10:53:24 - 'photogrammetry_scan_execute' >>> False [2s]
+10:53:26 - 'reconstruct_object' >>> False        [2s]
+10:53:28 - 'ply_quality_assessment' >>> False    [2s]
+10:53:30 - 'display_object' >>> False            [2s]
+
+Total: 24.21 seconds (10 sequential LLM calls)
+```
+
+## Why Not Parallel?
+
+**Current Implementation:**
+```python
+# Sequential
+for capability in remaining_capabilities:
+    result = await _classify_capability(...)  # One at a time
+```
+
+**Could Be Parallel:**
+```python
+# Parallel - All at once!
+tasks = [
+    _classify_capability(cap, task, state, logger, previous_failure)
+    for cap in remaining_capabilities
+]
+results = await asyncio.gather(*tasks)  # All in parallel
+
+# Would take ~2 seconds total instead of 24 seconds!
+```
+
+**Why It's Not Parallel (Speculation):**
+1. **Rate Limiting** - Avoid hitting LLM API rate limits
+2. **Cost Control** - Track/limit concurrent requests
+3. **Simplicity** - Sequential code is easier to debug
+4. **Historical** - Might have been parallel before, changed for stability
+
+## Does LangGraph Have Quick Classification Logic?
+
+**NO - LangGraph is Just the Execution Framework**
+
+LangGraph provides:
+- ✅ Node execution
+- ✅ State management
+- ✅ Routing between nodes
+- ✅ Checkpointing
+- ❌ NO built-in classification logic
+
+**What You Defined in LangGraph:**
+```python
+# In graph_builder.py
+workflow = StateGraph(AgentState)
+workflow.add_node("classifier", ClassificationNode.langgraph_node)
+workflow.add_edge("task_extraction", "classifier")
+```
+
+This just tells LangGraph:
+- "There's a node called 'classifier'"
+- "Run ClassificationNode.execute() when you reach it"
+- "Route to it after task_extraction"
+
+The actual classification logic (LLM calls, capability checking) is in your code (`classification_node.py`), not in LangGraph!
+
+## Optimization Opportunities
+
+### 1. Make It Parallel 🚀
+
+```python
+async def select_capabilities(
+    task: str,
+    available_capabilities: List[BaseCapability],
+    state: AgentState,
+    logger,
+    previous_failure: Optional[str] = None
+) -> List[str]:
+    
+    # Always-active capabilities (no LLM)
+    always_active_names = registry.get_always_active_capability_names()
+    active_capabilities = [
+        cap.name for cap in available_capabilities 
+        if cap.name in always_active_names
+    ]
+    
+    # Remaining capabilities need classification
+    remaining = [
+        cap for cap in available_capabilities 
+        if cap.name not in always_active_names
+    ]
+    
+    # ✅ PARALLEL - All at once!
+    classification_tasks = [
+        _classify_capability(cap, task, state, logger, previous_failure)
+        for cap in remaining
+    ]
+    
+    results = await asyncio.gather(*classification_tasks)
+    
+    # Add matched capabilities
+    for cap, is_required in zip(remaining, results):
+        if is_required:
+            active_capabilities.append(cap.name)
+    
+    return active_capabilities
+```
+
+**Result: 24 seconds → 2-3 seconds (10x faster!)**
+
+### 2. Cache Common Classifications
+
+```python
+# Cache for simple queries
+CLASSIFICATION_CACHE = {
+    "read motor position": ['motor_position_read', 'respond'],
+    "take image": ['detector_image_capture', 'respond'],
+    "move to 45": ['motor_position_set', 'respond']
+}
+
+if task.lower() in CLASSIFICATION_CACHE:
+    return CLASSIFICATION_CACHE[task.lower()]  # Instant!
+```
+
+### 3. Batch Classification (Advanced)
+
+```python
+# Single LLM call for all capabilities
+message = f"""
+Classify which capabilities are needed for this task.
+
+Task: {task}
+
+Capabilities:
+1. motor_position_read - Read motor angle
+2. motor_position_set - Move motor  
+3. detector_image_capture - Take image
+... (all 10 capabilities)
+
+Return JSON: {{"motor_position_read": true, "motor_position_set": false, ...}}
+"""
+
+# One call instead of 10!
+result = await get_chat_completion(message, output_model=ClassificationResult)
+```
+
+### 4. Early Termination
+
+```python
+# Stop checking once you have enough capabilities
+MINIMUM_CAPABILITIES = ['respond']  # Always need at least respond
+
+for capability in remaining_capabilities:
+    is_required = await _classify_capability(...)
+    if is_required:
+        active_capabilities.append(capability.name)
+        
+    # If we have a domain capability + respond, we're done!
+    if len(active_capabilities) >= 2 and 'respond' in active_capabilities:
+        logger.info("Found sufficient capabilities, stopping early")
+        break
+```
+
+## Summary Table
+
+| Aspect | Current Implementation | Why | Optimization |
+|--------|----------------------|-----|--------------|
+| Sequential vs Parallel | Sequential ❌ | Simplicity, rate limiting | Make parallel → 10x faster |
+| Number of LLM Calls | 10 calls (one per capability) | Each needs custom context | Batch into 1 call or cache |
+| Time Per Call | ~2 seconds | Network + LLM processing | Use faster model (GPT-3.5) |
+| Total Time | 24.21 seconds | 10 × 2s sequential | → 2-3s with parallel |
+| Always-Active | Skips LLM for respond, clarify ✅ | Smart optimization | Already optimized |
+| LangGraph Role | Just executes the node | Framework only | No built-in classification |
+| Caching | None ❌ | Not implemented | Cache common queries |
+
+## Key Findings
+
+**🔥 Biggest Bottleneck:**
+Sequential classification takes 24 seconds because it makes 10 LLM calls one-by-one instead of parallel.
+
+**✅ Already Optimized:**
+- `respond` and `clarify` are "always-active" (no LLM call needed)
+- Uses structured output (CapabilityMatch) for reliable parsing
+
+**🚀 Quick Win:**
+Make the classification calls parallel using `asyncio.gather()`:
+```python
+results = await asyncio.gather(*[
+    _classify_capability(cap, ...) 
+    for cap in remaining_capabilities
+])
+```
+This single change would reduce 24 seconds → 2-3 seconds!
+
+---
+
+# What Orchestration Does
+
+Orchestration transforms classified capabilities into a detailed, executable step-by-step plan with data flow.
+
+## The Complete Picture
+
+**Input to Orchestrator:**
+```python
+Task: "Read the motor position"
+Active Capabilities: ['respond', 'clarify', 'python', 'motor_position_read']
+Available Context: {} (empty for new queries)
+```
+
+**Output from Orchestrator:**
+```python
+ExecutionPlan with 2 steps:
+
+Step 1:
+  ├─ context_key: "current_motor_position"
+  ├─ capability: "motor_position_read"
+  ├─ task_objective: "Read the current position of the sample rotation 
+  │                   motor to determine its angle in degrees"
+  ├─ success_criteria: "Motor position successfully retrieved with angle value"
+  ├─ expected_output: "MOTOR_POSITION"
+  ├─ parameters: None
+  └─ inputs: []
+
+Step 2:
+  ├─ context_key: "motor_position_response"  
+  ├─ capability: "respond"
+  ├─ task_objective: "Provide the user with the current motor position 
+  │                   information including motor ID, angle, and timestamp"
+  ├─ success_criteria: "User receives clear response with motor position"
+  ├─ expected_output: None
+  ├─ parameters: None
+  └─ inputs: [{"MOTOR_POSITION": "current_motor_position"}]  # Data from Step 1
+```
+
+## What the Orchestrator Figures Out
+
+The orchestrator doesn't just pick capabilities - it creates a rich execution plan with:
+
+### 1. Execution Order
+- Which capability runs first, second, etc.
+- Ensures dependencies are satisfied
+
+### 2. Detailed Task Objectives
+- Not just "run motor_position_read"
+- But "Read the current position of the sample rotation motor to determine its angle in degrees"
+- Each step gets a clear, specific goal
+
+### 3. Data Flow Between Steps
+```
+Step 1 produces → MOTOR_POSITION context
+              ↓
+Step 2 consumes ← {"MOTOR_POSITION": "current_motor_position"}
+```
+- Connects outputs from one step to inputs of the next
+- Ensures data is available when needed
+
+### 4. Success Criteria
+- How to know if each step succeeded
+- Used for error handling and retries
+
+### 5. Context Keys
+- Unique identifiers for storing results
+- "current_motor_position" → stores motor reading
+- "motor_position_response" → stores final response
+
+## Why It Needs an LLM
+
+### The Challenge:
+
+The orchestrator receives just:
+- A list of capability names: `['motor_position_read', 'respond', 'python', 'clarify']`
+- A user task: `"Read the motor position"`
+
+**What It Must Create:**
+- ✅ Detailed step objectives - What should each step accomplish?
+- ✅ Execution order - Which order makes sense?
+- ✅ Data connections - Which step needs output from which other step?
+- ✅ Context keys - How to name and store intermediate results?
+- ✅ Success criteria - How to validate each step?
+
+This requires natural language understanding and reasoning - perfect for an LLM!
+
+## The LLM Call
+
+### Line in Code:
+
+`src/framework/infrastructure/orchestration_node.py` ~line 380-390:
+```python
+execution_plan = await asyncio.to_thread(
+    get_chat_completion,
+    message=message,
+    model_config=model_config,
+    output_model=ExecutionPlan  # Returns structured JSON
+)
+```
+
+### Input Message:
+```
+[System Instructions]
+You are an orchestrator. Create execution plans.
+
+Available capabilities:
+- motor_position_read: Read motor angle from hardware
+  - Provides: MOTOR_POSITION context
+  - Examples: [7 example plans showing how to use this capability]
+  
+- respond: Generate user response
+  - Requires: Context from previous steps
+  - Examples: [examples of response plans]
+
+- python: Execute Python code
+- clarify: Ask clarification questions
+
+[Rules for creating plans]
+- Each step needs: capability, task_objective, inputs, outputs
+- Steps must execute in logical order
+- Connect data flow between steps
+- Final step should be 'respond' or 'clarify'
+
+TASK TO PLAN: Read the motor position
+```
+
+### Output (Structured JSON):
+```json
+{
+  "steps": [
+    {
+      "context_key": "current_motor_position",
+      "capability": "motor_position_read",
+      "task_objective": "Read the current position of the sample rotation motor to determine its angle in degrees",
+      "success_criteria": "Motor position successfully retrieved with angle value",
+      "expected_output": "MOTOR_POSITION",
+      "inputs": []
+    },
+    {
+      "context_key": "motor_position_response",
+      "capability": "respond", 
+      "task_objective": "Provide the user with the current motor position information including motor ID, angle in degrees, and timestamp",
+      "success_criteria": "User receives clear response with motor position",
+      "inputs": [{"MOTOR_POSITION": "current_motor_position"}]
+    }
+  ]
+}
+```
+
+**Time: 10.55 seconds** (from your logs)
+
+## Why Not Hardcode?
+
+### Simple Query Example:
+"Read motor position" could be hardcoded:
+```python
+if query matches "read motor":
+    return [
+        {"capability": "motor_position_read"},
+        {"capability": "respond"}
+    ]
+```
+
+### But Complex Query Example:
+"Take images every 10 degrees from 0 to 180, then create a 3D model and assess quality"
+
+The orchestrator must:
+1. Break down the complex task into 20+ steps
+2. Create loops (repeat image capture 18 times)
+3. Track state (current angle position)
+4. Chain operations (images → 3D model → quality assessment)
+5. Connect data flow (scan results → reconstruction → assessment → response)
+
+**LLM Output:**
+```python
+{
+  "steps": [
+    # Step 1-18: Move motor and capture images
+    {"capability": "motor_position_set", "parameters": {"angle": 0}},
+    {"capability": "detector_image_capture"},
+    {"capability": "motor_position_set", "parameters": {"angle": 10}},
+    {"capability": "detector_image_capture"},
+    # ... (repeat 16 more times)
+    
+    # Step 19: Reconstruct 3D model from all images
+    {"capability": "photogrammetry_scan_execute", 
+     "inputs": [{"DETECTOR_IMAGE": "image_0"}, ..., {"DETECTOR_IMAGE": "image_17"}]},
+    
+    # Step 20: Assess quality
+    {"capability": "ply_quality_assessment",
+     "inputs": [{"RECONSTRUCT_OBJECT": "3d_model"}]},
+    
+    # Step 21: Respond with results
+    {"capability": "respond",
+     "inputs": [{"PLY_QUALITY_ASSESSMENT": "quality_report"}]}
+  ]
+}
+```
+
+This complex planning is why an LLM is needed!
+
+## Optimization Ideas
+
+### 1. Cache Common Patterns
+```python
+# Skip LLM for simple patterns
+SIMPLE_PATTERNS = {
+    "read motor position": [
+        {"capability": "motor_position_read"},
+        {"capability": "respond"}
+    ],
+    "take image": [
+        {"capability": "detector_image_capture"},
+        {"capability": "respond"}
+    ]
+}
+
+if query in SIMPLE_PATTERNS:
+    return SIMPLE_PATTERNS[query]  # Instant!
+else:
+    return await call_llm_orchestrator()  # 10s
+```
+
+### 2. Use Faster Model
+```python
+# GPT-4: 10s, very detailed
+# GPT-3.5-turbo: 2-3s, good enough for most plans
+model_config = {
+    "provider": "openai",
+    "model": "gpt-3.5-turbo",  # Faster!
+    "temperature": 0.0
+}
+```
+
+### 3. Parallel Planning (Advanced)
+```python
+# Run classification and rough planning in parallel
+classification_result, draft_plan = await asyncio.gather(
+    classify_task(query),
+    create_rough_plan(query)  # Quick pattern matching
+)
+# Then refine draft_plan with LLM if needed
+```
+
+## Summary
+
+| Aspect | Details |
+|--------|---------|
+| Input | Task + Classified capabilities |
+| Output | Detailed execution plan with 2+ steps |
+| LLM Call | Line 380-390 in orchestration_node.py |
+| Time | 10.55 seconds in your example |
+| What LLM Creates | Step objectives, data flow, success criteria, execution order |
+| Why LLM Needed | Natural language → structured plan with reasoning |
+| Model | Configured in model_config (likely GPT-4 or Claude) |
+| Optimization | Cache simple patterns, use faster models, or parallel processing |
+
+The orchestrator is essentially a "business analyst" that takes vague requirements (capabilities list + user task) and creates a detailed project plan that engineers (capabilities) can execute step-by-step!
+
+# Complete Logs 
 ```
 ================================================================================
 BOLT INTERACTIVE PROFILING SESSION
