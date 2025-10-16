@@ -1,5 +1,52 @@
 # Multi-Repo Agent Architecture Migration Guide
 
+## Part 0: Architecture Overview
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     FRAMEWORK REPOSITORY                    │
+│                                                             │
+│  ┌────────────────────────────────────────────────────┐     │
+│  │            LangGraph Orchestration Engine          │     │
+│  │                                                    │     │
+│  │  ┌──────────┐   ┌──────────────┐   ┌──────────┐    │     │
+│  │  │Classifier│──►│Orchestrator  │──►│ Router   │    │     │
+│  │  │  Node    │   │    Node      │   │  Node    │    │     │
+│  │  └──────────┘   └──────────────┘   └────┬─────┘    │     │
+│  │                                         │          │     │
+│  └─────────────────────────────────────────┼──────────┘     │
+│                                            │                │
+│  ┌─────────────────────────────────────────┼──────────┐     │
+│  │           Agent Registry Service        │          │     │
+│  │                                         ▼          │     │
+│  │  ┌──────────────────────────────────────────────┐  │     │
+│  │  │ agent_id → AgentInfo(url, capabilities)      │  │     │
+│  │  │ "BL5.3.1" → ["motor_control", ...]           │  │     │
+│  │  │ "BL7.0.1" → ["sample_stage", ...]            │  │     │
+│  │  └──────────────────────────────────────────────┘  │     │
+│  └────────────────────────────────────────────────────┘     │
+│                                                             │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+                         │  HTTP API (Port 8100)
+                         │  POST /register
+                         │  GET  /agents/{agent_id}
+                         │
+    ┌────────────────────┼────────────────────────────┐
+    │                    │                            │
+┌───▼──────────┐   ┌─────▼────────┐   ┌───────────────▼ ──┐
+│   AGENT 1    │   │   AGENT 2    │   │     AGENT N       │
+│ BL5.3.1      │   │ BL7.0.1      │   │ Custom Agent      │
+│ Capabilities:│   │ Capabilities:│   │ Capabilities:     │
+│ - motor_ctrl │   │ - sample_move│   │ - data_analysis   │
+│ - beam_align │   │ - temp_ctrl  │   │ - visualization   │
+│ Port: 8053   │   │ Port: 8071   │   │ Port: 8090        │
+└──────────────┘   └──────────────┘   └───────────────────┘
+     ▲                    ▲                     ▲
+     │                    │                     │
+     └────────────────────┴─────────────────────┘
+              Docker Network: agent-network
+
+```
 ## Part 1: Framework Repository Structure
 
 ```
@@ -33,6 +80,7 @@ alpha-berkeley-framework/
 │   │   │   ├── __init__.py                       # No change
 │   │   │   ├── gateway.py                        # No change
 │   │   │   ├── agent_registry.py                 # NEW - Remote agent registry
+│   │   │   ├── agent_registry_server.py          # NEW - FastAPI server for registry
 │   │   │   └── agent_client.py                   # NEW - HTTP client for agents
 │   │   ├── nodes/                                # No change - Core nodes
 │   │   │   ├── __init__.py
@@ -75,14 +123,13 @@ alpha-berkeley-framework/
 │
 ├── docker-compose.yml                            # NEW - At root (no deployment/ folder)
 ├── Dockerfile                                    # NEW - At root (no deployment/ folder)
+├── Dockerfile.registry                           # NEW - For registry service
 ├── .gitignore                                    # No change
 ├── .env.example                                  # NEW - At root (ONLY ONE)
 ├── config.yml                                    # MODIFIED - Remove applications list
 ├── pyproject.toml                                # MODIFIED - Add framework dependencies
 └── README.md                                     # MODIFIED - Update with new architecture
 ```
-
----
 
 ## Part 2: Agent Repository Structure (Example: beamline-531-agent)
 
@@ -92,10 +139,10 @@ beamline-531-agent/
 ├── src/
 │   ├── agent/
 │   │   ├── __init__.py
-│   │   ├── server.py                             # NEW - FastAPI HTTP server
+│   │   ├── server.py                             # NEW - FastAPI HTTP server (including auto-registration of capabilities when start up)
 │   │   ├── capabilities.py                       # Moved from framework
-│   │   ├── context.py                            # Moved from framework
-│   │   └── registry.py                           # Moved from framework
+│   │   ├── context.py                            # Moved from framework (if agent-specific)
+│   │   └── handlers.py                           # NEW - handle capability call requested from framework
 │   │
 │   └── lib/                                      # Agent-specific libraries
 │       ├── __init__.py
@@ -112,12 +159,85 @@ beamline-531-agent/
 ├── .env.example                                  # NEW - Agent env vars
 ├── config.yml                                    # NEW - Agent config
 ├── pyproject.toml                                # NEW - Agent dependencies
-├── requirements.txt                              # NEW - Agent requirements
 ├── .gitignore
 └── README.md                                     # NEW - Agent documentation
 ```
 
----
+## Ensures Scoped Capability Lookup
+
+**Problem**: 10 Agents × 10 Capabilities = 100 Total
+
+When a user with Agent BL5.3.1 asks "Move motor M1 to 45 degrees", we want to:
+- ✅ Check only Agent BL5.3.1's 10 capabilities
+- ❌ NOT check all 100 capabilities across all agents
+
+**Solution: Direct Agent ID-to-Agent Mapping**
+
+Registry Structure:
+```python
+{
+  "BL1": AgentInfo(url="...", capabilities=[10 BL1 capabilities]),
+  "BL5.3.1": AgentInfo(url="...", capabilities=[10 BL5.3.1 capabilities]),
+  "BL7.0.1": AgentInfo(url="...", capabilities=[10 BL7.0.1 capabilities]),
+  ...
+}
+```
+
+Lookup Process:
+```python
+# User with Agent BL5.3.1
+agent_id = "BL5.3.1"
+
+# O(1) lookup - get only this agent
+agent = registry.get_agent_by_id(agent_id)
+
+# Get capabilities - only 10!
+capabilities = agent.capabilities  
+
+# LLM classification sees only these 10, never the other 90!
+```
+
+**Result**: Framework only checks 10 relevant capabilities! ✅
+
+LangGraph Usage (with agent context):
+```python
+# Framework classifier node - only checks agent's capabilities
+async def classifier_node(state: AgentState) -> AgentState:
+    """Classify intent - only look at current agent's capabilities"""
+    
+    # Get agent context from state
+    agent_id = state.get("agent_id")  # e.g., "BL5.3.1"
+    
+    # Get agent by ID (O(1) lookup)
+    registry = get_agent_registry()
+    agent = registry.get_agent_by_id(agent_id)
+    
+    if not agent:
+        return {**state, "error": f"No agent found with ID: {agent_id}"}
+    
+    # Get capabilities - only 10 for this agent!
+    capabilities = agent.capabilities
+    
+    # Classify with LLM (sees only 10 capabilities, not 100!)
+    prompt = f"""
+    You are helping a user with Agent {agent_id}.
+    
+    Available capabilities: {', '.join(capabilities)}
+    
+    User request: {state['input']}
+    
+    Which capability should be used?
+    """
+    
+    llm_response = await llm.ainvoke(prompt)
+    
+    return {
+        **state,
+        "agent_url": agent.url,
+        "capability": llm_response.capability,
+        "parameters": llm_response.parameters
+    }
+```
 
 ## Part 3: New Code Implementation
 
@@ -139,6 +259,7 @@ class AgentInfo(BaseModel):
     """Information about a registered agent."""
     name: str
     url: str
+    agent_id: str  # Unique agent identifier (e.g., "BL5.3.1")
     capabilities: List[str]
     status: str = "active"
     registered_at: datetime
@@ -146,43 +267,72 @@ class AgentInfo(BaseModel):
 
 
 class AgentRegistry:
-    """Registry for tracking remote agents and their capabilities."""
+    """Registry for tracking remote agents and their capabilities.
+    
+    Uses direct agent_id-to-agent mapping for O(1) lookups.
+    This ensures that when querying capabilities for a specific agent,
+    only that agent's capabilities are checked (e.g., 10 instead of 100).
+    """
     
     def __init__(self):
-        self._agents: Dict[str, AgentInfo] = {}
+        # PRIMARY INDEX: Direct agent_id → agent mapping for O(1) lookup
+        self._agents_by_id: Dict[str, AgentInfo] = {}
+        
+        # SECONDARY INDEX: Capability → agent names (for cross-agent queries)
         self._capability_map: Dict[str, List[str]] = {}
     
     def register_agent(
         self,
         name: str,
         url: str,
+        agent_id: str,  # REQUIRED - unique agent identifier
         capabilities: List[str]
     ) -> None:
-        """Register a new agent with its capabilities."""
+        """Register a new agent with its capabilities.
+        
+        Args:
+            name: Agent name
+            url: Agent URL
+            agent_id: Unique agent identifier (e.g., "BL5.3.1", "BL1", "agent_foo")
+            capabilities: List of capability names
+        """
         agent_info = AgentInfo(
             name=name,
             url=url,
+            agent_id=agent_id,
             capabilities=capabilities,
             registered_at=datetime.now(),
             last_heartbeat=datetime.now()
         )
         
-        self._agents[name] = agent_info
+        # Store by agent_id for O(1) lookup
+        self._agents_by_id[agent_id] = agent_info
         
-        # Update capability map
+        # Update capability map (for cross-agent capability search)
         for capability in capabilities:
             if capability not in self._capability_map:
                 self._capability_map[capability] = []
             if name not in self._capability_map[capability]:
                 self._capability_map[capability].append(name)
         
-        logger.info(f"Registered agent '{name}' with capabilities: {capabilities}")
+        logger.info(
+            f"Registered agent '{name}' (ID: {agent_id}) "
+            f"with {len(capabilities)} capabilities"
+        )
     
     def unregister_agent(self, name: str) -> None:
         """Remove an agent from the registry."""
-        if name in self._agents:
-            agent_info = self._agents[name]
-            
+        # Find agent by name (need to search through agents_by_id)
+        agent_info = None
+        agent_id_to_remove = None
+        
+        for ag_id, agent in self._agents_by_id.items():
+            if agent.name == name:
+                agent_info = agent
+                agent_id_to_remove = ag_id
+                break
+        
+        if agent_info and agent_id_to_remove:
             # Remove from capability map
             for capability in agent_info.capabilities:
                 if capability in self._capability_map:
@@ -190,26 +340,65 @@ class AgentRegistry:
                     if not self._capability_map[capability]:
                         del self._capability_map[capability]
             
-            del self._agents[name]
-            logger.info(f"Unregistered agent '{name}'")
+            # Remove from agents
+            del self._agents_by_id[agent_id_to_remove]
+            logger.info(f"Unregistered agent '{name}' (ID: {agent_id_to_remove})")
     
     def get_agent(self, name: str) -> Optional[AgentInfo]:
-        """Get information about a specific agent."""
-        return self._agents.get(name)
+        """Get information about a specific agent by name."""
+        for agent in self._agents_by_id.values():
+            if agent.name == name:
+                return agent
+        return None
+    
+    def get_agent_by_id(self, agent_id: str) -> Optional[AgentInfo]:
+        """Get agent by its unique ID - O(1) lookup.
+        
+        This is the PRIMARY method for agent-scoped queries.
+        
+        Args:
+            agent_id: Unique agent identifier (e.g., "BL5.3.1")
+            
+        Returns:
+            Agent info for this ID, or None if not found
+        """
+        return self._agents_by_id.get(agent_id)
+    
+    def get_agent_capabilities(self, agent_id: str) -> List[str]:
+        """Get all capabilities for a specific agent.
+        
+        This ensures only the agent's capabilities are returned
+        (e.g., 10 capabilities for one agent, not all 100).
+        
+        Args:
+            agent_id: Unique agent identifier
+            
+        Returns:
+            List of capability names for this agent
+        """
+        agent = self._agents_by_id.get(agent_id)
+        return agent.capabilities if agent else []
     
     def get_agents_for_capability(self, capability: str) -> List[AgentInfo]:
-        """Get all agents that provide a specific capability."""
+        """Get all agents that provide a specific capability.
+        
+        This is for cross-agent queries (less common).
+        """
         agent_names = self._capability_map.get(capability, [])
-        return [self._agents[name] for name in agent_names if name in self._agents]
+        return [
+            agent for agent in self._agents_by_id.values() 
+            if agent.name in agent_names
+        ]
     
     def list_all_agents(self) -> List[AgentInfo]:
         """List all registered agents."""
-        return list(self._agents.values())
+        return list(self._agents_by_id.values())
     
     def update_heartbeat(self, name: str) -> None:
         """Update the last heartbeat time for an agent."""
-        if name in self._agents:
-            self._agents[name].last_heartbeat = datetime.now()
+        agent = self.get_agent(name)
+        if agent:
+            agent.last_heartbeat = datetime.now()
 
 
 # Global registry instance
@@ -219,6 +408,86 @@ _registry = AgentRegistry()
 def get_agent_registry() -> AgentRegistry:
     """Get the global agent registry instance."""
     return _registry
+```
+
+### Framework: agent_registry_server.py
+
+```python
+"""Agent Registry HTTP Server."""
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List
+from datetime import datetime
+import uvicorn
+
+from framework.infrastructure.agent_registry import get_agent_registry
+
+app = FastAPI(title="Agent Registry Service")
+
+class AgentRegistration(BaseModel):
+    name: str
+    url: str
+    agent_id: str
+    capabilities: List[str]
+
+@app.post("/register")
+async def register_agent(registration: AgentRegistration):
+    """Register a new agent with the framework."""
+    registry = get_agent_registry()
+    
+    try:
+        registry.register_agent(
+            name=registration.name,
+            url=registration.url,
+            agent_id=registration.agent_id,
+            capabilities=registration.capabilities
+        )
+        return {
+            "status": "registered",
+            "agent_id": registration.agent_id,
+            "message": f"Agent {registration.name} registered successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/unregister/{agent_name}")
+async def unregister_agent(agent_name: str):
+    """Unregister an agent."""
+    registry = get_agent_registry()
+    registry.unregister_agent(agent_name)
+    return {"status": "unregistered", "agent": agent_name}
+
+@app.get("/agents")
+async def list_agents():
+    """List all registered agents."""
+    registry = get_agent_registry()
+    agents = registry.list_all_agents()
+    return {"agents": [agent.dict() for agent in agents]}
+
+@app.get("/agents/{agent_id}")
+async def get_agent(agent_id: str):
+    """Get a specific agent by ID."""
+    registry = get_agent_registry()
+    agent = registry.get_agent_by_id(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
+    return agent.dict()
+
+@app.post("/agents/{agent_name}/heartbeat")
+async def agent_heartbeat(agent_name: str):
+    """Update heartbeat for an agent."""
+    registry = get_agent_registry()
+    registry.update_heartbeat(agent_name)
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8100)
 ```
 
 ### Framework: agent_client.py
@@ -296,292 +565,238 @@ class AgentClient:
 ### Agent: server.py (FastAPI HTTP Server)
 
 ```python
-"""FastAPI HTTP Server for Agent."""
+"""Agent Server with Auto-Registration."""
 
+import os
 import logging
-from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uvicorn
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+import httpx
 
-from agent.registry import get_agent_registry
-from agent.capabilities import get_capability_handler
+from agent.capabilities import get_capability_registry
+from agent.handlers import capability_router
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Agent Server")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage agent lifecycle - register on startup, cleanup on shutdown."""
+    # Startup
+    await register_with_framework()
+    yield
+    # Shutdown (optional cleanup)
+    await unregister_from_framework()
 
 
-class CapabilityRequest(BaseModel):
-    """Request model for capability invocation."""
-    parameters: Dict[str, Any]
-    context: Dict[str, Any] = {}
+app = FastAPI(
+    title="Agent Server",
+    lifespan=lifespan  # Clean lifecycle management
+)
+
+# Include capability routes
+app.include_router(capability_router)
 
 
-class CapabilityResponse(BaseModel):
-    """Response model for capability results."""
-    success: bool
-    result: Any
-    error: Optional[str] = None
+async def register_with_framework():
+    """Register this agent with the framework."""
+    # Skip if not configured
+    if not os.getenv("FRAMEWORK_REGISTRY_URL"):
+        logger.info("No FRAMEWORK_REGISTRY_URL configured, skipping registration")
+        return
+    
+    # Get configuration from environment
+    config = {
+        "name": os.getenv("AGENT_NAME", "unnamed_agent"),
+        "url": f"http://{os.getenv('HOSTNAME', 'localhost')}:{os.getenv('AGENT_PORT', '8000')}",
+        "agent_id": os.getenv("AGENT_ID"),  # Required for scoped lookup
+        "capabilities": get_capability_registry().list_capability_names()
+    }
+    
+    # Validate required fields
+    if not config["agent_id"]:
+        raise ValueError("AGENT_ID environment variable is required")
+    
+    # Register
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.post(
+                f"{os.getenv('FRAMEWORK_REGISTRY_URL')}/register",
+                json=config
+            )
+            response.raise_for_status()
+            logger.info(f"✅ Registered agent '{config['name']}' (ID: {config['agent_id']})")
+        except Exception as e:
+            logger.error(f"❌ Registration failed: {e}")
+            # Decide: fail fast or continue without registration
+            if os.getenv("REQUIRE_REGISTRATION", "false").lower() == "true":
+                raise
+
+
+async def unregister_from_framework():
+    """Unregister from framework on shutdown (optional)."""
+    if not os.getenv("FRAMEWORK_REGISTRY_URL"):
+        return
+    
+    agent_name = os.getenv("AGENT_NAME")
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            await client.delete(
+                f"{os.getenv('FRAMEWORK_REGISTRY_URL')}/unregister/{agent_name}"
+            )
+            logger.info(f"Unregistered agent '{agent_name}'")
+        except Exception:
+            pass  # Best effort on shutdown
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Simple health check endpoint."""
     return {"status": "healthy"}
 
 
-@app.get("/capabilities")
-async def list_capabilities():
-    """List all available capabilities."""
-    registry = get_agent_registry()
-    capabilities = registry.list_capabilities()
-    return {"capabilities": [cap.name for cap in capabilities]}
-
-
-@app.post("/capability/{capability_name}")
-async def invoke_capability(
-    capability_name: str,
-    request: CapabilityRequest
-) -> CapabilityResponse:
-    """
-    Invoke a capability on this agent.
-    
-    Args:
-        capability_name: Name of the capability to invoke
-        request: Request containing parameters and context
-        
-    Returns:
-        Result of the capability execution
-    """
-    try:
-        # Get capability handler
-        handler = get_capability_handler(capability_name)
-        if not handler:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Capability '{capability_name}' not found"
-            )
-        
-        # Execute capability
-        result = await handler.execute(
-            parameters=request.parameters,
-            context=request.context
-        )
-        
-        return CapabilityResponse(
-            success=True,
-            result=result
-        )
-        
-    except Exception as e:
-        logger.error(f"Capability execution failed: {e}")
-        return CapabilityResponse(
-            success=False,
-            result=None,
-            error=str(e)
-        )
-
-
-def start_server(host: str = "0.0.0.0", port: int = 8051):
-    """Start the agent server."""
-    uvicorn.run(app, host=host, port=port)
-
-
 if __name__ == "__main__":
-    import os
-    host = os.getenv("AGENT_HOST", "0.0.0.0")
-    port = int(os.getenv("AGENT_PORT", "8051"))
-    start_server(host=host, port=port)
+    import uvicorn
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=int(os.getenv("AGENT_PORT", "8000"))
+    )
 ```
 
 ### Agent: capabilities.py
 
 ```python
-"""Agent Capabilities - Moved from framework/applications."""
+"""Agent Capabilities Registry - Self-contained and simple."""
 
-from typing import Any, Dict, Optional
-from pydantic import BaseModel
+from typing import List, Dict, Any
+from abc import ABC, abstractmethod
 
 
-class CapabilityHandler:
-    """Base class for capability handlers."""
+class Capability(ABC):
+    """Base capability class - simple and clean."""
     
     def __init__(self, name: str, description: str):
         self.name = name
         self.description = description
     
-    async def execute(
-        self,
-        parameters: Dict[str, Any],
-        context: Dict[str, Any]
-    ) -> Any:
-        """Execute the capability logic."""
-        raise NotImplementedError
+    @abstractmethod
+    async def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute the capability."""
+        pass
 
 
-# Motor Control Capability
-class MotorControlCapability(CapabilityHandler):
-    """Control motors on Beamline 5.3.1."""
+class MotorControlCapability(Capability):
+    """Control motors on the beamline."""
     
     def __init__(self):
         super().__init__(
             name="motor_control",
-            description="Control beamline motors (position, velocity, etc.)"
+            description="Control beamline motors"
         )
     
-    async def execute(
-        self,
-        parameters: Dict[str, Any],
-        context: Dict[str, Any]
-    ) -> Any:
-        """Execute motor control logic."""
-        motor_name = parameters.get("motor_name", "")
-        target_position = parameters.get("target_position", 0)
+    async def execute(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        motor = parameters.get("motor_name")
+        position = parameters.get("position")
         
-        # Your existing motor control logic here
-        # This is the same code from src/applications/beamline_531/capabilities/
-        
-        # Example: EPICS motor control
-        pv = f"BL531:{motor_name}:POSITION"
-        # caput(pv, target_position)
+        # Your actual motor control logic here
+        # await self.move_motor(motor, position)
         
         return {
             "success": True,
-            "motor": motor_name,
-            "position": target_position,
-            "message": f"Motor {motor_name} moved to {target_position}"
+            "motor": motor,
+            "position": position
         }
 
 
-# Beam Alignment Capability
-class BeamAlignmentCapability(CapabilityHandler):
-    """Align the beam on Beamline 5.3.1."""
+class CapabilityRegistry:
+    """Simple registry for agent capabilities."""
     
     def __init__(self):
-        super().__init__(
-            name="beam_alignment",
-            description="Perform beam alignment procedures"
-        )
+        self.capabilities = {}
+        self._register_capabilities()
     
-    async def execute(
-        self,
-        parameters: Dict[str, Any],
-        context: Dict[str, Any]
-    ) -> Any:
-        """Execute beam alignment logic."""
-        alignment_type = parameters.get("type", "auto")
+    def _register_capabilities(self):
+        """Register all capabilities for this agent."""
+        # Add all capabilities here
+        capabilities = [
+            MotorControlCapability(),
+            # BeamAlignmentCapability(),
+            # ShutterControlCapability(),
+        ]
         
-        # Your existing beam alignment logic here
-        
-        return {
-            "success": True,
-            "alignment_type": alignment_type,
-            "beam_centered": True,
-            "message": "Beam alignment completed successfully"
-        }
-
-
-# Shutter Control Capability
-class ShutterControlCapability(CapabilityHandler):
-    """Control shutters on Beamline 5.3.1."""
+        for cap in capabilities:
+            self.capabilities[cap.name] = cap
     
-    def __init__(self):
-        super().__init__(
-            name="shutter_control",
-            description="Open/close beamline shutters"
-        )
+    def get(self, name: str) -> Capability:
+        """Get capability by name."""
+        return self.capabilities.get(name)
     
-    async def execute(
-        self,
-        parameters: Dict[str, Any],
-        context: Dict[str, Any]
-    ) -> Any:
-        """Execute shutter control logic."""
-        shutter_id = parameters.get("shutter_id", "")
-        action = parameters.get("action", "open")  # "open" or "close"
-        
-        # Your existing shutter control logic here
-        pv = f"BL531:SHUTTER:{shutter_id}:STATE"
-        # caput(pv, 1 if action == "open" else 0)
-        
-        return {
-            "success": True,
-            "shutter": shutter_id,
-            "state": action,
-            "message": f"Shutter {shutter_id} {action}ed"
-        }
+    def list_capability_names(self) -> List[str]:
+        """Get list of capability names for registration."""
+        return list(self.capabilities.keys())
 
 
-# Capability registry for this agent
-_capabilities = {
-    "motor_control": MotorControlCapability(),
-    "beam_alignment": BeamAlignmentCapability(),
-    "shutter_control": ShutterControlCapability()
-}
+# Global instance
+_registry = CapabilityRegistry()
 
-
-def get_capability_handler(name: str) -> Optional[CapabilityHandler]:
-    """Get a capability handler by name."""
-    return _capabilities.get(name)
+def get_capability_registry() -> CapabilityRegistry:
+    return _registry
 ```
 
-### Agent: registry.py
+### Agent: handlers.py
 
 ```python
-"""Agent Registry - List capabilities for this agent."""
+"""API route handlers for capabilities."""
 
-from typing import List
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from typing import Dict, Any
+
+from agent.capabilities import get_capability_registry
+
+router = APIRouter(prefix="/capability", tags=["capabilities"])
 
 
-class CapabilityInfo(BaseModel):
-    """Information about a capability."""
-    name: str
-    description: str
+class CapabilityRequest(BaseModel):
+    parameters: Dict[str, Any]
+    context: Dict[str, Any] = {}
 
 
-class AgentRegistry:
-    """Registry of capabilities provided by this agent."""
+@router.post("/{capability_name}")
+async def execute_capability(capability_name: str, request: CapabilityRequest):
+    """Execute a capability."""
+    registry = get_capability_registry()
+    capability = registry.get(capability_name)
     
-    def __init__(self):
-        self._capabilities: List[CapabilityInfo] = []
-    
-    def register_capability(self, name: str, description: str):
-        """Register a capability."""
-        self._capabilities.append(
-            CapabilityInfo(name=name, description=description)
+    if not capability:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Capability '{capability_name}' not found"
         )
     
-    def list_capabilities(self) -> List[CapabilityInfo]:
-        """List all registered capabilities."""
-        return self._capabilities
+    try:
+        result = await capability.execute(request.parameters)
+        return {"success": True, "result": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
-# Global registry
-_agent_registry = AgentRegistry()
-
-# Register capabilities for Beamline 5.3.1
-_agent_registry.register_capability(
-    "motor_control",
-    "Control beamline motors (position, velocity, etc.)"
-)
-_agent_registry.register_capability(
-    "beam_alignment",
-    "Perform beam alignment procedures"
-)
-_agent_registry.register_capability(
-    "shutter_control",
-    "Open/close beamline shutters"
-)
+@router.get("/")
+async def list_capabilities():
+    """List available capabilities."""
+    registry = get_capability_registry()
+    return {
+        "capabilities": [
+            {"name": name, "description": cap.description}
+            for name, cap in registry.capabilities.items()
+        ]
+    }
 
 
-def get_agent_registry() -> AgentRegistry:
-    """Get the agent registry."""
-    return _agent_registry
+# Export router for inclusion in main app
+capability_router = router
 ```
-
----
 
 ## Part 4: Docker Configuration Files
 
@@ -736,6 +951,24 @@ EXPOSE 8000
 CMD ["python", "-m", "uvicorn", "framework.api:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
+### Framework: Dockerfile.registry (AT ROOT)
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install minimal dependencies for registry service
+RUN pip install --no-cache-dir fastapi uvicorn httpx pydantic
+
+# Copy registry code
+COPY src/framework/infrastructure/agent_registry.py /app/
+COPY src/framework/infrastructure/agent_registry_server.py /app/
+
+# Run registry server
+CMD ["python", "agent_registry_server.py"]
+```
+
 ### Framework: .env.example (AT ROOT - ONLY ONE)
 
 ```bash
@@ -888,8 +1121,6 @@ file_paths:
   checkpoints: checkpoints
 ```
 
----
-
 ## Agent Files
 
 ### Agent: docker-compose.yml
@@ -910,12 +1141,12 @@ services:
     environment:
       - AGENT_PORT=8053
       - AGENT_NAME=beamline_531_control
-      - AGENT_HOST=0.0.0.0
+      - HOSTNAME=beamline-531-agent  # Container name for network discovery
+      - AGENT_ID=BL5.3.1  # Agent ID for scoped capability lookup
       # Optional: Auto-register with framework
       - FRAMEWORK_REGISTRY_URL=${FRAMEWORK_REGISTRY_URL}
       - AUTO_REGISTER=${AUTO_REGISTER:-false}
       # Beamline-specific env vars
-      - BEAMLINE_ID=5.3.1
       - EPICS_CA_ADDR_LIST=${EPICS_CA_ADDR_LIST}
       - EPICS_CA_SERVER_PORT=${EPICS_CA_SERVER_PORT}
       - EPICS_CA_MAX_ARRAY_BYTES=${EPICS_CA_MAX_ARRAY_BYTES:-16384}
@@ -953,9 +1184,9 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy and install from pyproject.toml
+COPY pyproject.toml .
+RUN pip install --no-cache-dir -e .
 
 # Copy source code
 COPY src/ /app/src/
@@ -977,14 +1208,13 @@ CMD ["python", "src/agent/server.py"]
 # Agent Configuration
 AGENT_PORT=8053
 AGENT_NAME=beamline_531_control
-AGENT_HOST=0.0.0.0
+AGENT_ID=BL5.3.1
 
 # Framework Integration (Optional)
 FRAMEWORK_REGISTRY_URL=http://agent-registry:8100
 AUTO_REGISTER=false
 
 # Beamline-Specific Configuration
-BEAMLINE_ID=5.3.1
 EPICS_CA_ADDR_LIST=10.0.0.1
 EPICS_CA_SERVER_PORT=5064
 EPICS_CA_MAX_ARRAY_BYTES=16384
@@ -1033,17 +1263,6 @@ dev = [
 ]
 ```
 
-### Agent: requirements.txt
-
-```
-fastapi>=0.104.0
-uvicorn>=0.24.0
-pydantic>=2.5.0
-httpx>=0.25.0
-python-dotenv>=1.0.0
-pyepics>=3.5.0
-```
-
 ### Agent: config.yml
 
 ```yaml
@@ -1052,7 +1271,7 @@ agent:
   name: beamline_531_control
   version: "0.1.0"
   description: "Control agent for ALS Beamline 5.3.1"
-  beamline_id: "5.3.1"
+  agent_id: "BL5.3.1"  # Unique agent identifier
 
 # Capabilities provided by this agent
 capabilities:
@@ -1086,8 +1305,6 @@ safety:
   max_motor_speed: ${MAX_MOTOR_SPEED:-10.0}
 ```
 
----
-
 ## Usage Instructions
 
 ### Starting the Framework
@@ -1100,14 +1317,17 @@ cp .env.example .env
 # Start core services only
 docker compose --profile core up -d
 
+# Start core + registry
+docker compose --profile core --profile registry up -d
+
 # Start core + UI
 docker compose --profile core --profile ui up -d
 
 # Start everything (including dev tools)
-docker compose --profile core --profile ui --profile dev up -d
+docker compose --profile core --profile ui --profile dev --profile registry up -d
 
 # Stop all services
-docker compose --profile core --profile ui --profile dev down
+docker compose --profile core --profile ui --profile dev --profile registry down
 ```
 
 ### Starting an Agent
@@ -1132,49 +1352,49 @@ docker compose down
 
 ### Development Workflow
 
-1. **Clone framework repo** - Set up core infrastructure
-2. **Clone agent repos** - One for each agent you want to run
-3. **Start framework** - `docker compose --profile core up -d`
-4. **Start agents** - In each agent repo: `docker compose up -d`
-5. **Agents connect** - They automatically join the `agent-network`
-
----
+1. Clone framework repo - Set up core infrastructure
+2. Clone agent repos - One for each agent you want to run
+3. Start framework - `docker compose --profile core --profile registry up -d`
+4. Start agents - In each agent repo: `docker compose up -d`
+5. Agents connect - They automatically join the agent-network and register
 
 ## Migration Checklist
 
 - [ ] Create new framework repo without `src/applications/`
-- [ ] Add `agent_registry.py` and `agent_client.py` to framework
+- [ ] Add `agent_registry.py`, `agent_registry_server.py`, and `agent_client.py` to `framework/infrastructure/`
+- [ ] Add `Dockerfile.registry` to framework root
 - [ ] Create agent repo for each existing application
-- [ ] Move capabilities/context/registry from framework to agent
-- [ ] Add FastAPI server to each agent
-- [ ] Test framework deployment
-- [ ] Test agent deployment
-- [ ] Test framework-agent communication
+- [ ] Move capabilities from framework to agent
+- [ ] Move agent-specific context classes to agent (if any)
+- [ ] Add FastAPI server (`server.py`) to each agent
+- [ ] Add `handlers.py` for routing to each agent
+- [ ] Test framework deployment with registry service
+- [ ] Test agent deployment and auto-registration
+- [ ] Test framework-agent communication via HTTP
 - [ ] Update documentation
 - [ ] Archive old monorepo (optional)
 
----
-
 ## Key Changes Summary
 
-**Framework Repository:**
+### Framework Repository:
 - ✅ Keep all existing framework code
-- ➕ Add 2 new files: `agent_registry.py`, `agent_client.py`
+- ➕ Add 3 new files: `agent_registry.py`, `agent_registry_server.py`, `agent_client.py`
+- ➕ Add `Dockerfile.registry` for registry service
 - ➖ Remove `src/applications/` directory
 - ➖ Remove `deployment/` directory
-- 🔄 Move `docker-compose.yml` and `Dockerfile` to root
-- 🔄 Simplify `config.yml` (remove applications list)
+- 📄 Move `docker-compose.yml` and `Dockerfile` to root
+- 📄 Simplify `config.yml` (remove applications list)
 - ➕ Use only `pyproject.toml` (no requirements.txt)
 - ➕ Single `.env.example` at root
 
-**Agent Repositories:**
+### Agent Repositories:
 - ➕ Create new repo for each agent
 - ➕ Add FastAPI HTTP server (`server.py`)
 - 📦 Move capability code from framework
 - ➕ Add Docker Compose + Dockerfile at root
 - ➕ Add dedicated configuration
 
-**No Logic Changes:**
+### No Logic Changes:
 - All your existing capability logic stays the same
 - LangGraph orchestration unchanged
 - Registry system unchanged
